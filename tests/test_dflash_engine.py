@@ -1698,6 +1698,64 @@ class TestDFlashPretokenizedPrompt:
         engine._tokenizer_obj.encode.assert_called_once_with("hello")
 
 
+class TestDFlashNoRepeatNgram:
+    """dflash-mlx has no logits processor hook, so its lane refuses the ban."""
+
+    @staticmethod
+    def _engine():
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(encode=lambda s: [1, 2, 3])
+        engine._should_fallback = lambda toks: False
+        engine._stream_dflash_events = MagicMock(
+            side_effect=AssertionError("dflash should not run")
+        )
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_dflash_lane_rejects_no_repeat_ngram(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine()
+        with pytest.raises(InvalidRequestError, match="no_repeat_ngram_size"):
+            await engine.generate("hello", no_repeat_ngram_size=35)
+        with pytest.raises(InvalidRequestError, match="no_repeat_ngram_size"):
+            async for _ in engine.stream_generate("hello", no_repeat_ngram_size=35):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_preflight_rejects_only_requests_that_stay_on_dflash(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine()
+        engine._prefill_guard = None
+        engine._fallback_engine_type = "vlm"
+        engine._max_dflash_ctx = 100
+        engine.count_chat_tokens = MagicMock(return_value=12)
+        text = [{"role": "user", "content": "hi"}]
+        image = [{"role": "user", "content": [{"type": "image_url"}]}]
+
+        with pytest.raises(InvalidRequestError, match="no_repeat_ngram_size"):
+            await engine.preflight_chat(text, no_repeat_ngram_size=35)
+        # Images and prompts at the context limit run on the fallback engine.
+        await engine.preflight_chat(image, no_repeat_ngram_size=35)
+        engine.count_chat_tokens.return_value = 100
+        await engine.preflight_chat(text, no_repeat_ngram_size=35)
+
+    @pytest.mark.asyncio
+    async def test_fallback_engine_gets_no_repeat_ngram(self):
+        engine = self._engine()
+        engine._in_fallback_mode = True
+        engine._fallback_engine = SimpleNamespace(generate=AsyncMock())
+
+        await engine.generate("hello", no_repeat_ngram_size=35, ngram_window=128)
+
+        kwargs = engine._fallback_engine.generate.call_args.kwargs
+        assert (kwargs["no_repeat_ngram_size"], kwargs["ngram_window"]) == (35, 128)
+
+
 class TestDFlashActivityTracking:
     """DFlash bypasses the scheduler, so the admin Active Models card reads
     the engine's own activity snapshot (#2396)."""

@@ -29,7 +29,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
-from ..exceptions import PrefillMemoryAbortedError
+from ..exceptions import InvalidRequestError, PrefillMemoryAbortedError
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -51,6 +51,15 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _EXECUTOR_DRAIN_TIMEOUT = 10.0
+
+
+def _reject_no_repeat_ngram(kwargs: dict[str, Any]) -> None:
+    """dflash-mlx samples inside its own loop, with no logits processor hook."""
+    if kwargs.get("no_repeat_ngram_size"):
+        raise InvalidRequestError(
+            "no_repeat_ngram_size is not supported by the DFlash engine",
+            field="no_repeat_ngram_size",
+        )
 
 
 def _get_dflash_stop_token_ids(
@@ -1334,6 +1343,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 messages, tools=tools, request_id=request_id, **kwargs
             )
             return
+        # Reject before the stream starts if the request stays on dflash-mlx;
+        # image and long-context requests move to the fallback engine.
+        if kwargs.get("no_repeat_ngram_size") and not (
+            self.supports_multimodal_fallback and self._has_multimodal_content(messages)
+        ):
+            num_tokens = self.count_chat_tokens(
+                messages,
+                tools,
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+                is_partial=kwargs.get("is_partial"),
+            )
+            if self._max_dflash_ctx is None or num_tokens < self._max_dflash_ctx:
+                _reject_no_repeat_ngram(kwargs)
         if self._prefill_guard is None:
             _warn_scheduler_unreachable_once(
                 self, "preflight_chat", "primary-mode prefill guard unavailable"
@@ -1834,6 +1856,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         repetition_context_size = kwargs.pop("repetition_context_size", None)
         if repetition_context_size is None:
             repetition_context_size = 20
+        _reject_no_repeat_ngram(kwargs)
 
         from ..engine_core import get_mlx_executor
 
@@ -2076,6 +2099,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         repetition_context_size = kwargs.pop("repetition_context_size", None)
         if repetition_context_size is None:
             repetition_context_size = 20
+        _reject_no_repeat_ngram(kwargs)
 
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
