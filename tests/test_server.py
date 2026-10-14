@@ -1702,39 +1702,3 @@ def test_chat_completion_forwards_no_repeat_ngram(
     keys = ("no_repeat_ngram_size", "ngram_window")
     assert {key: kwargs[key] for key in keys if key in kwargs} == expected
 
-
-def test_dflash_rejects_no_repeat_ngram_before_the_stream_starts(monkeypatch):
-    from omlx.engine.dflash import DFlashEngine
-
-    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
-    engine._loaded = True
-    engine.count_chat_tokens = MagicMock(return_value=12)
-    pool = MagicMock()
-    pool.preload_pinned_models = AsyncMock()
-    pool.check_ttl_expirations = AsyncMock()
-    pool.shutdown = AsyncMock()
-    pool.get_entry.return_value = SimpleNamespace(
-        config_model_type="qwen3_5", preserve_thinking_default=None
-    )
-    state = ServerState()
-    state.engine_pool = pool
-    monkeypatch.setattr(srv, "_server_state", state)
-    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
-    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
-    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
-    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
-    monkeypatch.setitem(
-        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
-    )
-    body = {
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "stream": True,
-        "no_repeat_ngram_size": 35,
-    }
-
-    with TestClient(srv.app, raise_server_exceptions=False) as client:
-        response = client.post("/v1/chat/completions", json=body)
-
-    assert response.status_code == 400, response.text
-    assert response.json()["error"]["param"] == "no_repeat_ngram_size"

@@ -167,6 +167,14 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
     split_namespace_tool_name,
 )
+from .api.decisions import (
+    READOUT_TEMPLATE_KWARGS,
+    DecisionsRequestError,
+    decide,
+    from_systemone,
+    to_systemone,
+)
+from .api.decisions_models import DecisionRequest
 from .api.systemone_models import SystemOneRequest
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
@@ -4133,6 +4141,141 @@ async def create_systemone(
         raise
 
 
+def _is_decision_model(model: str) -> bool:
+    pool = get_engine_pool()
+    entry = pool.get_entry(pool.resolve_model_id(model, _server_state.settings_manager))
+    return entry is not None and entry.engine_type == "decision"
+
+
+@app.post("/v1/decisions")
+async def create_decisions(
+    request: DecisionRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_inference_api_key),
+):
+    """
+    Answer typed questions about an input with option probabilities.
+
+    OpenAI Decisions API compatible endpoint. Chat models answer each
+    ``predicate``, ``choice`` or ``score`` question from the next-token
+    probabilities of the option letters; decision models use their own heads.
+
+    Example request:
+    ```json
+    {
+        "model": "qwen3-8b",
+        "input": "Checkout fails for every customer since the last deploy.",
+        "questions": [
+            {"type": "predicate", "name": "urgent", "instructions": "Is this urgent?"}
+        ]
+    }
+    ```
+    """
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+    _reject_lone_surrogates(request)
+
+    # The lease keeps the model loaded until the response is sent.
+    lease = _LLMEngineLease()
+    try:
+        if _is_decision_model(request.model):
+            engine = await get_decision_engine(request.model, lease)
+            try:
+                plan = await engine.encode(to_systemone(request))
+            except DecisionContextLengthError as e:
+                raise HTTPException(status_code=413, detail=str(e)) from e
+            except DecisionRequestError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+            async def _decide():
+                start_time = time.perf_counter()
+                result = await engine.systemone(plan)
+                return (
+                    from_systemone(request, result["answers"]),
+                    result["input_tokens"],
+                    0,
+                    time.perf_counter() - start_time,
+                )
+
+        else:
+            engine = await get_engine_for_model(request.model, lease=lease)
+            multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
+                engine, "supports_multimodal_fallback", False
+            )
+
+            def _prepare_readout(messages):
+                try:
+                    num_prompt_tokens, prepared = _prepare_chat_prompt_for_request(
+                        engine,
+                        messages,
+                        chat_template_kwargs=READOUT_TEMPLATE_KWARGS,
+                        is_partial=True,
+                    )
+                except Exception as e:
+                    if _is_chat_template_error(e):
+                        raise HTTPException(
+                            status_code=400, detail=f"Chat template error: {e}"
+                        ) from e
+                    raise
+                validate_context_window(num_prompt_tokens, request.model)
+                return {} if prepared is None else {"_prepared_prompt": prepared}
+
+            async def _decide():
+                await _raise_if_llm_lease_abort_requested(lease)
+                start_time = time.perf_counter()
+                try:
+                    result = await decide(
+                        engine, request, multimodal, prepare=_prepare_readout
+                    )
+                except DecisionsRequestError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                return (
+                    result["answers"],
+                    result["input_tokens"],
+                    result["cached_tokens"],
+                    time.perf_counter() - start_time,
+                )
+
+        return await _json_response_or_keepalive(
+            http_request, _decisions_body(request, _decide(), lease), lease=lease
+        )
+    except BaseException:
+        await lease.release()
+        raise
+
+
+async def _decisions_body(
+    request: DecisionRequest, run, lease: _LLMEngineLease
+) -> str:
+    answers, input_tokens, cached_tokens, elapsed = await run
+    resolved_model = _serving_model_id(lease, request.model)
+    logger.info(
+        f"Decisions: model={resolved_model}, {len(request.questions)} "
+        f"questions, {input_tokens} tokens in {elapsed:.3f}s"
+    )
+    get_server_metrics().record_request_complete(
+        prompt_tokens=input_tokens,
+        completion_tokens=0,
+        cached_tokens=cached_tokens,
+        prefill_duration=elapsed,
+        model_id=resolved_model,
+        request_duration=elapsed,
+    )
+    return json.dumps(
+        {
+            "object": "decision",
+            "model": request.model,
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+        ensure_ascii=False,
+    )
+
+
 # =============================================================================
 # Completion Endpoints
 # =============================================================================
@@ -4421,9 +4564,6 @@ def _extract_chat_messages(
         ),
     )
     is_vlm = isinstance(engine, VLMBatchedEngine)
-    is_dflash_vlm = not is_vlm and getattr(
-        engine, "supports_multimodal_fallback", False
-    )
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         extractor_kwargs = {}
@@ -4438,8 +4578,8 @@ def _extract_chat_messages(
             engine.tokenizer,
             **extractor_kwargs,
         )
-    elif is_vlm or is_dflash_vlm:
-        # VLM or DFlash with VLM fallback: preserve image_url content parts
+    elif is_vlm:
+        # VLM: preserve image_url content parts
         messages = extract_multimodal_content(
             request.messages,
             max_tool_result_tokens,
@@ -7160,9 +7300,6 @@ async def create_anthropic_message(
         # Convert Anthropic format to internal format
         # Harmony models need special handling to preserve tool format
         is_vlm = isinstance(engine, VLMBatchedEngine)
-        is_dflash_vlm = not is_vlm and getattr(
-            engine, "supports_multimodal_fallback", False
-        )
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -7189,7 +7326,7 @@ async def create_anthropic_message(
                 request,
                 max_tool_result_tokens,
                 engine.tokenizer,
-                preserve_images=is_vlm or is_dflash_vlm,
+                preserve_images=is_vlm,
                 native_reasoning_content=native_reasoning,
                 consolidate_system_messages=False,
             )
@@ -7850,9 +7987,7 @@ async def create_response(
         # Images in function_call_output lists survive only for engines that
         # can extract them; text engines get a placeholder instead so base64
         # payloads never reach the prompt (#2989).
-        preserve_tool_images = isinstance(engine, VLMBatchedEngine) or getattr(
-            engine, "supports_multimodal_fallback", False
-        )
+        preserve_tool_images = isinstance(engine, VLMBatchedEngine)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,
